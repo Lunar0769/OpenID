@@ -1,0 +1,37 @@
+[project]
+name = "openid-ocr"
+version = "0.1.0"
+description = "OpenID Verify — Drop-in capture, quality gate, and OCR for passports and ID cards"
+
+authors = [
+    { name = "Kavya Patel" },
+    { name = "Jetri Vyas" },
+]
+
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+# Camera capture + quality gate (OpenCV-based)
+camera = [
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+]
+
+[project.scripts]
+openid = "openid.cli.main:main"
+
+[tool.setuptools.packages.find]
+include = ["openid*"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project.urls]
+Homepage = "https://openid.ai"
+Documentation = "https://docs.openid.ai"
