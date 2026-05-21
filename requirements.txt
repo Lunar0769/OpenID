@@ -1,9 +1,10 @@
-# Core SDK (always required)
+# Core SDK
 requests>=2.31.0
 
-# Camera capture + quality gate (optional — pip install openid-ocr[camera])
+# Image processing (headless — no GUI required on server)
 numpy>=1.24.0
-opencv-python>=4.8.0
+opencv-python-headless>=4.8.0
+pillow>=10.0.0
 
-streamlit
-pillow
+# Web UI
+streamlit>=1.35.0
