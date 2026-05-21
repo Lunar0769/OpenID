@@ -25,6 +25,7 @@ from openid.config import DEFAULT_BASE_URL, DEFAULT_TIMEOUT
 from openid.exceptions import APIConnectionError, APIResponseError, ImageQualityError
 from openid.capture.quality import check_quality, detect_document_contour
 from openid.capture.overlay import get_guide_box
+from openid.capture.strict_validation import validate_capture_strict
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -130,7 +131,7 @@ tab_upload, tab_camera = st.tabs(["📁 Upload File", "📷 Camera"])
 # OVERLAY HELPER — draw guide box + document contour + stats on a BGR frame
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _draw_overlay(bgr: np.ndarray) -> np.ndarray:
+def _draw_overlay(bgr: np.ndarray, camera_mode: bool = False) -> tuple[np.ndarray, dict]:
     """
     Draw on a copy of bgr:
       • Dimmed region outside the guide box
@@ -143,7 +144,7 @@ def _draw_overlay(bgr: np.ndarray) -> np.ndarray:
     h, w  = frame.shape[:2]
 
     # ── Quality check ─────────────────────────────────────────────────────────
-    q       = check_quality(frame, camera_mode=False)
+    q       = check_quality(frame, camera_mode=camera_mode)
     status  = q["status"]
     metrics = q["metrics"]
     reasons = q["reasons"]
@@ -180,7 +181,7 @@ def _draw_overlay(bgr: np.ndarray) -> np.ndarray:
     cv2.rectangle(frame, (gx, gy), (gx+gw, gy+gh), color, 1)
 
     # ── Document contour (cyan) ───────────────────────────────────────────────
-    contour, _ = detect_document_contour(frame, camera_mode=False)
+    contour, _ = detect_document_contour(frame, camera_mode=camera_mode)
     if contour is not None:
         cv2.drawContours(frame, [contour], -1, (200, 200, 0), max(2, tk), cv2.LINE_AA)
 
@@ -223,7 +224,7 @@ def _draw_overlay(bgr: np.ndarray) -> np.ndarray:
         cv2.putText(frame, text, (margin + 4 + 1, y + 1), font, scale * 0.9, (0,0,0), 2, cv2.LINE_AA)
         cv2.putText(frame, text, (margin + 4,     y),     font, scale * 0.9, tcol,    1, cv2.LINE_AA)
 
-    return frame
+    return frame, q
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -316,12 +317,32 @@ def _save_upload(uploaded_file) -> str:
     return tmp.name
 
 
-def _show_overlay(bgr: np.ndarray, caption: str = "") -> None:
-    """Draw overlay on bgr and display in Streamlit."""
-    annotated = _draw_overlay(bgr)
+def _show_overlay(bgr: np.ndarray, caption: str = "", camera_mode: bool = False) -> None:
+    """Draw overlay on bgr, display in Streamlit, and show quality metrics."""
+    annotated, quality = _draw_overlay(bgr, camera_mode=camera_mode)
     # Convert BGR → RGB for st.image
     rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
     st.image(rgb, caption=caption, use_container_width=True)
+
+    # ── Quality metrics (matches CLI output) ──────────────────────────────
+    status  = quality["status"]
+    metrics = quality["metrics"]
+    reasons = quality["reasons"]
+
+    cols = st.columns(4)
+    status_emoji = {"pass": "🟢", "warning": "🟡", "fail": "🔴"}.get(status, "🔴")
+    cols[0].metric("Status", f"{status_emoji} {status.upper()}")
+    cols[1].metric("Blur Score", f"{metrics['blur_score']:.0f}")
+    cols[2].metric("Brightness", f"{metrics['brightness']:.0f}")
+    doc_pct = metrics["document_area_ratio"] * 100
+    cols[3].metric("Document", f"{'✓' if metrics['document_detected'] else '✗'} ({doc_pct:.0f}%)")
+
+    if status == "fail":
+        reason_str = " · ".join(r.replace("_", " ").title() for r in reasons)
+        st.error(f"🚫 Quality FAIL — {reason_str}")
+    elif status == "warning":
+        reason_str = " · ".join(r.replace("_", " ").title() for r in reasons)
+        st.warning(f"⚠️ Quality WARNING — {reason_str}")
 
 
 def _validate_inputs(key: str) -> bool:
@@ -338,6 +359,35 @@ def _run_extraction(client: OpenIDClient, tmp_paths: list) -> dict | None:
             return None
         return client.extract_id(tmp_paths[0], tmp_paths[1], doc_type=DOC_TYPE_MAP[doc_option])
     return client.extract_passport(tmp_paths[0])
+
+
+def _run_strict_validation(bgr: np.ndarray, doc_type: str = "passport") -> dict | None:
+    """
+    Run strict post-capture validation (glare, shadow, finger, MRZ).
+    Mirrors the CLI's validate_capture_strict() call.
+    Returns error dict if validation fails, None if passed.
+    """
+    validation_error = validate_capture_strict(bgr, doc_type=doc_type)
+    if validation_error:
+        error_code = validation_error.get("error", "UNKNOWN")
+        action = validation_error.get("action", "Please try again.")
+
+        error_labels = {
+            "DOCUMENT_NOT_FOUND":    "📄 Document Not Found",
+            "DOCUMENT_INVALID":      "📄 Invalid Document",
+            "LIGHT_GLARE_DETECTED":  "💡 Glare Detected",
+            "SHADOW_DETECTED":       "🌑 Shadow Detected",
+            "FINGERS_DETECTED":      "✋ Fingers Detected",
+            "MRZ_NOT_VISIBLE":       "🔤 MRZ Not Visible",
+        }
+
+        label = error_labels.get(error_code, f"❌ {error_code}")
+        st.error(f"{label}: {action}")
+        with st.expander("🔍 Validation details", expanded=False):
+            st.json(validation_error)
+        return validation_error
+    st.success("✅ Strict validation passed (glare, shadow, finger, MRZ checks OK)")
+    return None
 
 
 def _handle_errors(exc: Exception) -> None:
@@ -390,6 +440,25 @@ with tab_upload:
             st.error("Please upload a passport image.")
             st.stop()
 
+        # ── Strict validation (same checks as CLI) ───────────────────
+        st.subheader("🔬 Strict Validation")
+        doc_type_val = DOC_TYPE_MAP.get(doc_option, "passport") if is_id_card else "passport"
+
+        if is_id_card:
+            st.caption("Front side:")
+            front_file.seek(0)
+            if _run_strict_validation(_pil_to_cv2(Image.open(front_file)), doc_type=doc_type_val):
+                st.stop()
+            st.caption("Back side:")
+            back_file.seek(0)
+            if _run_strict_validation(_pil_to_cv2(Image.open(back_file)), doc_type=doc_type_val):
+                st.stop()
+        else:
+            passport_file.seek(0)
+            if _run_strict_validation(_pil_to_cv2(Image.open(passport_file)), doc_type="passport"):
+                st.stop()
+
+        # ── Extract via API ──────────────────────────────────────────
         client = OpenIDClient(api_key=api_key, base_url=DEFAULT_BASE_URL, timeout=timeout)
         tmp_paths = []
         try:
@@ -424,19 +493,19 @@ with tab_camera:
         front_cam = st.camera_input("Capture front", key="cam_front")
         if front_cam:
             front_bgr = _pil_to_cv2(Image.open(front_cam))
-            _show_overlay(front_bgr, "Front — quality overlay")
+            _show_overlay(front_bgr, "Front — quality overlay", camera_mode=True)
 
         st.markdown("### Step 2 — Back of ID card")
         back_cam = st.camera_input("Capture back", key="cam_back")
         if back_cam:
             back_bgr = _pil_to_cv2(Image.open(back_cam))
-            _show_overlay(back_bgr, "Back — quality overlay")
+            _show_overlay(back_bgr, "Back — quality overlay", camera_mode=True)
 
     else:
         passport_cam = st.camera_input("Capture passport", key="cam_passport")
         if passport_cam:
             passport_bgr = _pil_to_cv2(Image.open(passport_cam))
-            _show_overlay(passport_bgr, "Passport — quality overlay")
+            _show_overlay(passport_bgr, "Passport — quality overlay", camera_mode=True)
 
     st.markdown("---")
     camera_btn = st.button("🔍 Extract from Camera", type="primary", key="btn_camera")
@@ -456,16 +525,38 @@ with tab_camera:
                 st.error("Please capture the passport first.")
                 st.stop()
 
+        # ── Strict validation (same checks as CLI camera flow) ────
+        st.subheader("🔬 Strict Validation")
+        doc_type_val = DOC_TYPE_MAP.get(doc_option, "passport") if is_id_card else "passport"
+
+        if is_id_card:
+            st.caption("Front side:")
+            front_cam.seek(0)
+            if _run_strict_validation(_pil_to_cv2(Image.open(front_cam)), doc_type=doc_type_val):
+                st.stop()
+            st.caption("Back side:")
+            back_cam.seek(0)
+            if _run_strict_validation(_pil_to_cv2(Image.open(back_cam)), doc_type=doc_type_val):
+                st.stop()
+        else:
+            passport_cam.seek(0)
+            if _run_strict_validation(_pil_to_cv2(Image.open(passport_cam)), doc_type="passport"):
+                st.stop()
+
+        # ── Extract via API ──────────────────────────────────────────
         client = OpenIDClient(api_key=api_key, base_url=DEFAULT_BASE_URL, timeout=timeout)
         tmp_paths = []
         try:
             with st.spinner("Extracting..."):
                 if is_id_card:
+                    front_cam.seek(0)
+                    back_cam.seek(0)
                     tmp_paths = [
                         _save_cv2_to_tmp(_pil_to_cv2(Image.open(front_cam))),
                         _save_cv2_to_tmp(_pil_to_cv2(Image.open(back_cam))),
                     ]
                 else:
+                    passport_cam.seek(0)
                     tmp_paths = [_save_cv2_to_tmp(_pil_to_cv2(Image.open(passport_cam)))]
                 result = _run_extraction(client, tmp_paths)
             if result:
