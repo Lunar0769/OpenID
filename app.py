@@ -2,14 +2,16 @@
 OpenID Verify — Streamlit Web UI
 =================================
 File-upload mode for hosted/cloud deployment (no webcam required).
+API base URL is read from openid/config.py — no manual entry needed.
 """
 
-import json
-import tempfile
 import os
+import tempfile
+
 import streamlit as st
 
 from openid import OpenIDClient
+from openid.config import DEFAULT_BASE_URL, DEFAULT_TIMEOUT
 from openid.exceptions import APIConnectionError, APIResponseError, ImageQualityError
 
 
@@ -36,20 +38,15 @@ api_key = st.sidebar.text_input(
     placeholder="Enter your OpenID API key",
 )
 
-api_url = st.sidebar.text_input(
-    "API URL",
-    value=os.environ.get("OPENID_API_URL", "https://api.openid.ai"),
-)
-
 timeout = st.sidebar.number_input(
     "Timeout (seconds)",
     min_value=10,
     max_value=300,
-    value=30,
+    value=DEFAULT_TIMEOUT,
 )
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Camera capture is not available in the hosted version. Upload an image file instead.")
+st.sidebar.caption(f"API: `{DEFAULT_BASE_URL}`")
 
 
 # ── Document type ─────────────────────────────────────────────────────────────
@@ -62,8 +59,8 @@ doc_option = st.selectbox(
 is_id_card = doc_option != "Passport"
 
 DOC_TYPE_MAP = {
-    "Emirates ID":        "emirates_id",
-    "Driving License":    "driving_license",
+    "Emirates ID":           "emirates_id",
+    "Driving License":       "driving_license",
     "ID Card (Auto-detect)": "auto",
 }
 
@@ -73,27 +70,36 @@ DOC_TYPE_MAP = {
 if is_id_card:
     col1, col2 = st.columns(2)
     with col1:
+        st.markdown("**Front of ID card**")
         front_file = st.file_uploader(
-            "Front of ID card (JPEG / PNG, max 10 MB)",
+            "JPEG / PNG, max 10 MB",
             type=["jpg", "jpeg", "png"],
             key="front",
         )
+        if front_file:
+            st.image(front_file, caption="Front", use_container_width=True)
     with col2:
+        st.markdown("**Back of ID card**")
         back_file = st.file_uploader(
-            "Back of ID card (JPEG / PNG, max 10 MB)",
+            "JPEG / PNG, max 10 MB",
             type=["jpg", "jpeg", "png"],
             key="back",
         )
+        if back_file:
+            st.image(back_file, caption="Back", use_container_width=True)
 else:
     passport_file = st.file_uploader(
         "Passport image (JPEG / PNG, max 10 MB)",
         type=["jpg", "jpeg", "png"],
         key="passport",
     )
+    if passport_file:
+        st.image(passport_file, caption="Uploaded passport", use_container_width=True)
 
 
 # ── Extract button ────────────────────────────────────────────────────────────
 
+st.markdown("---")
 extract_btn = st.button("🔍 Extract", type="primary")
 
 
@@ -116,17 +122,18 @@ def _display_result(result: dict) -> None:
     with st.expander("📦 Full JSON response", expanded=False):
         st.json(result)
 
-    # Flat top-level fields (passport response)
+    # Flat top-level fields (standard passport/ID response)
     flat_fields = ["name", "document_number", "dob", "expiry", "country", "document_subtype"]
     flat_data = {k: v for k, v in result.items() if k in flat_fields and v}
 
-    # Nested ocrData (some API versions)
+    # Nested ocrData (some API response formats)
     ocr_data = result.get("data", {}).get("ocrData", {})
-
-    display_data = flat_data or {
+    nested_data = {
         k: v for k, v in ocr_data.items()
         if v and k not in ("notExtracted", "ocrDataConfidence")
     }
+
+    display_data = flat_data or nested_data
 
     if display_data:
         st.subheader("📋 Extracted Fields")
@@ -144,7 +151,6 @@ def _display_result(result: dict) -> None:
 
 if extract_btn:
 
-    # Validate inputs
     if not api_key:
         st.error("Please enter your API key in the sidebar.")
         st.stop()
@@ -161,8 +167,11 @@ if extract_btn:
             st.error("Please upload a passport image.")
             st.stop()
 
-    # Run extraction
-    client = OpenIDClient(api_key=api_key, base_url=api_url, timeout=timeout)
+    client = OpenIDClient(
+        api_key=api_key,
+        base_url=DEFAULT_BASE_URL,
+        timeout=timeout,
+    )
     tmp_paths = []
 
     try:
@@ -172,8 +181,11 @@ if extract_btn:
                 front_path = _save_upload(front_file)
                 back_path  = _save_upload(back_file)
                 tmp_paths  = [front_path, back_path]
-                doc_type   = DOC_TYPE_MAP[doc_option]
-                result     = client.extract_id(front_path, back_path, doc_type=doc_type)
+                result     = client.extract_id(
+                    front_path,
+                    back_path,
+                    doc_type=DOC_TYPE_MAP[doc_option],
+                )
             else:
                 passport_path = _save_upload(passport_file)
                 tmp_paths     = [passport_path]
@@ -192,13 +204,12 @@ if extract_btn:
 
     except APIConnectionError as e:
         st.error(f"🔌 Connection error: {e}")
-        st.caption("Check that the API URL is correct and the service is reachable.")
+        st.caption("The API server may be unreachable. Check your connection.")
 
     except Exception as e:
         st.exception(e)
 
     finally:
-        # Clean up temp files
         for path in tmp_paths:
             try:
                 os.unlink(path)
